@@ -14,6 +14,7 @@ Uninstall restores the backups and removes ``gateway/platforms/napcat.py``.
 """
 from __future__ import annotations
 
+import ast
 import importlib.util
 import os
 import re
@@ -75,11 +76,33 @@ def _restore(path: Path) -> bool:
 
 
 def _read(path: Path) -> str:
-    return path.read_text(encoding="utf-8")
+    # newline="" so CRLF/LF pass through unchanged (see _write).
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        return f.read()
 
 
 def _write(path: Path, content: str) -> None:
-    path.write_text(content, encoding="utf-8")
+    # newline="" so we never rewrite the file's existing line endings
+    # (write_text would translate "\n" to CRLF on Windows).
+    path.write_text(content, encoding="utf-8", newline="")
+
+
+def _write_checked(path: Path, content: str) -> None:
+    """Write a patched Python file only if it still compiles.
+
+    On a syntax error the target file is left untouched and installation
+    aborts with a clear message, instead of leaving the Hermes gateway
+    unable to start.
+    """
+    try:
+        compile(content, str(path), "exec")
+    except SyntaxError as e:
+        raise RuntimeError(
+            f"Patch would break {path} (SyntaxError at line {e.lineno}: {e.msg}).\n"
+            f"The file was NOT modified. The Hermes source layout has likely "
+            f"changed — please update hermes-napcat or report this issue."
+        ) from e
+    _write(path, content)
 
 
 # ── Step 1: copy adapter ──────────────────────────────────────────────────────
@@ -134,7 +157,6 @@ def _uninstall_adapter(hermes_root: Path) -> None:
 # ── Step 2: patch gateway/config.py ──────────────────────────────────────────
 
 _CONFIG_MARKER = "# napcat-installed"
-_NAPCAT_ENUM_LINE = '    NAPCAT = "napcat"  ' + _CONFIG_MARKER
 
 
 def _patch_config(hermes_root: Path) -> None:
@@ -146,24 +168,35 @@ def _patch_config(hermes_root: Path) -> None:
         print("  [=] gateway/config.py already patched")
         return
 
-    # Insert NAPCAT into the Platform enum after the last existing member
-    # We look for the class definition and insert before the closing line
-    pattern = r'(class Platform\(.*?Enum.*?\):.*?)(^\s*\w+ = "[^"]+"\s*$)'
-    match = re.search(pattern, src, re.MULTILINE | re.DOTALL)
-    if not match:
-        # Fallback: find last quoted enum value and insert after it
-        last = list(re.finditer(r'^    \w+ = "[^"]+"', src, re.MULTILINE))
-        if not last:
-            raise RuntimeError("Could not find Platform enum in gateway/config.py")
-        pos = last[-1].end()
-        src = src[:pos] + "\n" + _NAPCAT_ENUM_LINE + src[pos:]
-    else:
-        # Insert after the last member found by the full pattern scan
-        last = list(re.finditer(r'^    \w+ = "[^"]+"', src, re.MULTILINE))
-        pos = last[-1].end()
-        src = src[:pos] + "\n" + _NAPCAT_ENUM_LINE + src[pos:]
+    # Locate the Platform enum class via AST and insert NAPCAT after its
+    # last simple assignment (regex over the whole file could match an
+    # unrelated assignment in a later class).
+    try:
+        tree = ast.parse(src)
+    except SyntaxError as e:
+        raise RuntimeError(f"gateway/config.py does not parse (line {e.lineno})") from e
 
-    _write(path, src)
+    platform_cls = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "Platform":
+            platform_cls = node
+            break
+    if platform_cls is None:
+        raise RuntimeError("Could not find Platform enum in gateway/config.py")
+
+    last_assign = None
+    for stmt in platform_cls.body:
+        if isinstance(stmt, ast.Assign):
+            last_assign = stmt
+    if last_assign is None:
+        raise RuntimeError("Platform enum in gateway/config.py has no members")
+
+    lines = src.splitlines(keepends=True)
+    insert_idx = last_assign.end_lineno  # 0-based index of the next line
+    enum_line = " " * last_assign.col_offset + 'NAPCAT = "napcat"  ' + _CONFIG_MARKER
+    src = "".join(lines[:insert_idx]) + enum_line + "\n" + "".join(lines[insert_idx:])
+
+    _write_checked(path, src)
     print("  [+] Patched gateway/config.py (Platform.NAPCAT)")
 
 
@@ -187,19 +220,27 @@ def _patch_run(hermes_root: Path) -> None:
         print("  [=] gateway/run.py already patched")
         return
 
-    # Locate _create_adapter function definition
-    func_match = re.search(r'^([ \t]*)def _create_adapter\(', src, re.MULTILINE)
-    if not func_match:
-        raise RuntimeError("Could not find _create_adapter in gateway/run.py")
-    func_pos = func_match.start()
+    # Locate _create_adapter via AST — regex-based indentation guessing broke
+    # when upstream's function body contained nested blocks before the first
+    # top-level elif/return (see issue: SyntaxError after install).
+    try:
+        tree = ast.parse(src)
+    except SyntaxError as e:
+        raise RuntimeError(f"gateway/run.py does not parse (line {e.lineno}) — is the Hermes install corrupted?") from e
 
-    # Detect body indentation from the first elif/return inside the function
-    body_match = re.search(r'\n([ \t]+)(elif|return)\s', src[func_pos:])
-    body_indent = body_match.group(1) if body_match else "        "
+    func = None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "_create_adapter":
+            func = node
+            break
+    if func is None:
+        raise RuntimeError("Could not find _create_adapter in gateway/run.py")
+
+    body_indent = " " * func.body[0].col_offset
     inner_indent = body_indent + "    "
 
     napcat_block = (
-        f"\n{body_indent}elif platform == Platform.NAPCAT:  {_RUN_MARKER}\n"
+        f"{body_indent}elif platform == Platform.NAPCAT:  {_RUN_MARKER}\n"
         f"{inner_indent}from gateway.platforms.napcat import NapCatAdapter, check_napcat_requirements\n"
         f"{inner_indent}if not check_napcat_requirements():\n"
         f"{inner_indent}    logger.warning('NapCat: aiohttp not installed')\n"
@@ -207,30 +248,32 @@ def _patch_run(hermes_root: Path) -> None:
         f"{inner_indent}return NapCatAdapter(config)\n"
     )
 
-    # Insert before the final "return None" inside _create_adapter
-    return_match = re.search(
-        r'(?m)^' + re.escape(body_indent) + r'return None\b',
-        src[func_pos:],
-    )
-    if return_match:
-        insert_pos = func_pos + return_match.start()
-        src = src[:insert_pos] + napcat_block + src[insert_pos:]
-    else:
-        # Fallback: insert after the last elif at body indent level
-        last_elif = list(re.finditer(
-            r'(?m)^' + re.escape(body_indent) + r'elif platform == Platform\.\w+:',
-            src[func_pos:],
-        ))
-        if not last_elif:
-            raise RuntimeError("Could not find adapter dispatch in gateway/run.py")
-        pos = func_pos + last_elif[-1].start()
-        next_block = re.search(
-            r'\n' + re.escape(body_indent) + r'(elif|else|return)', src[pos:]
-        )
-        insert_pos = pos + next_block.start(0) + 1 if next_block else len(src)
-        src = src[:insert_pos] + napcat_block + src[insert_pos:]
+    # Find the last top-level if/elif chain in the function body that
+    # dispatches on `platform`, and append our elif right after it.
+    dispatch_if = None
+    for stmt in func.body:
+        if isinstance(stmt, ast.If):
+            test_src = ast.get_source_segment(src, stmt.test) or ""
+            if "platform" in test_src:
+                dispatch_if = stmt
+    if dispatch_if is None:
+        raise RuntimeError("Could not find adapter dispatch in gateway/run.py")
 
-    _write(path, src)
+    # Refuse to append an elif to a chain that ends in a bare `else:`.
+    node = dispatch_if
+    while node.orelse and len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If):
+        node = node.orelse[0]
+    if node.orelse:
+        raise RuntimeError(
+            "_create_adapter dispatch chain ends in an else clause — "
+            "cannot append NapCat branch; please update hermes-napcat."
+        )
+
+    lines = src.splitlines(keepends=True)
+    insert_idx = dispatch_if.end_lineno  # 0-based index of the line after the chain
+    new_src = "".join(lines[:insert_idx]) + "\n" + napcat_block + "".join(lines[insert_idx:])
+
+    _write_checked(path, new_src)
     print("  [+] Patched gateway/run.py (_create_adapter)")
 
 
@@ -298,22 +341,34 @@ def _patch_toolsets(hermes_root: Path) -> None:
                 text = text[:m.start(2)] + new_includes + text[m.end(2):]
         return text
 
-    # Insert the napcat toolset block before the last closing brace of TOOLSETS.
-    # The block already ends with '},\n' so the dict entry is properly terminated.
-    last_brace = src.rfind("\n}")
-    if last_brace == -1:
-        print("  [!] Cannot locate TOOLSETS dict end — skipping")
+    # Insert the napcat toolset block before the closing brace of the
+    # TOOLSETS dict, located via AST (rfind("\n}") could hit a later dict).
+    try:
+        tree = ast.parse(src)
+    except SyntaxError as e:
+        raise RuntimeError(f"toolsets.py does not parse (line {e.lineno})") from e
+
+    toolsets_dict = None
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name) and tgt.id == "TOOLSETS":
+                    toolsets_dict = node.value
+    if toolsets_dict is None or not toolsets_dict.values:
+        print("  [!] Cannot locate TOOLSETS dict — skipping")
         return
 
-    # Ensure the entry just before the insertion point ends with a comma.
-    before = src[:last_brace].rstrip()
-    if before and not before.endswith(','):
-        src = before + ',\n' + _NAPCAT_TOOLSET_BLOCK + src[last_brace:]
+    # Insert after the last entry, just before the dict's closing brace line.
+    lines = src.splitlines(keepends=True)
+    close_line = toolsets_dict.end_lineno - 1  # 0-based line of the final "}"
+    head = "".join(lines[:close_line])
+    if head.rstrip().endswith((",", "{")):
+        src = head + _NAPCAT_TOOLSET_BLOCK + "".join(lines[close_line:])
     else:
-        src = src[:last_brace] + _NAPCAT_TOOLSET_BLOCK + src[last_brace:]
+        src = head.rstrip() + ",\n" + _NAPCAT_TOOLSET_BLOCK + "".join(lines[close_line:])
     src = _add_to_gateway_includes(src)
 
-    _write(path, src)
+    _write_checked(path, src)
     print("  [+] Patched toolsets.py (hermes-napcat toolset)")
 
 
@@ -356,7 +411,7 @@ def _patch_platforms(hermes_root: Path) -> None:
         eol = src.index("\n", last[-1].end())
         src = src[:eol + 1] + _NAPCAT_PLATFORMS_LINE + "\n" + src[eol + 1:]
 
-    _write(path, src)
+    _write_checked(path, src)
     print("  [+] Patched hermes_cli/platforms.py (napcat platform entry)")
 
 
@@ -366,43 +421,75 @@ def _unpatch_platforms(hermes_root: Path) -> None:
         print("  [-] Restored hermes_cli/platforms.py")
 
 
-# ── Step 6: patch gateway/run.py _is_user_authorized ─────────────────────────
+# ── Step 6: patch gateway auth check (_is_user_authorized) ───────────────────
+#
+# The NapCat adapter enforces its own dm_policy / allow_from at intake, so the
+# gateway's env-var allowlist check must not default-deny NapCat events.
+# Upstream has moved this check over time:
+#   - older Hermes: gateway/run.py, tuple syntax  (Platform.X, Platform.Y)
+#   - newer Hermes: gateway/authz_mixin.py, set syntax  {Platform.X, Platform.Y}
+# We try each known (file, target, replacement) triple in order.
 
 _RUN_AUTH_MARKER = "# napcat-installed-auth"
-_RUN_AUTH_TARGET = "if source.platform in (Platform.HOMEASSISTANT, Platform.WEBHOOK):"
-_RUN_AUTH_REPLACEMENT = (
-    "if source.platform in (Platform.HOMEASSISTANT, Platform.WEBHOOK, Platform.NAPCAT):  "
-    + _RUN_AUTH_MARKER
-)
+_AUTH_PATCH_SITES = [
+    (
+        Path("gateway") / "authz_mixin.py",
+        "if source.platform in {Platform.HOMEASSISTANT, Platform.WEBHOOK}:",
+        "if source.platform in {Platform.HOMEASSISTANT, Platform.WEBHOOK, Platform.NAPCAT}:  "
+        + _RUN_AUTH_MARKER,
+    ),
+    (
+        Path("gateway") / "run.py",
+        "if source.platform in (Platform.HOMEASSISTANT, Platform.WEBHOOK):",
+        "if source.platform in (Platform.HOMEASSISTANT, Platform.WEBHOOK, Platform.NAPCAT):  "
+        + _RUN_AUTH_MARKER,
+    ),
+]
+
+
+def _auth_patch_paths(hermes_root: Path) -> list[Path]:
+    return [hermes_root / rel for rel, _, _ in _AUTH_PATCH_SITES]
 
 
 def _patch_run_auth(hermes_root: Path) -> None:
-    path = hermes_root / "gateway" / "run.py"
-    src = _read(path)
-
-    if _RUN_AUTH_MARKER in src:
-        print("  [=] gateway/run.py auth bypass already patched")
-        return
-
-    if _RUN_AUTH_TARGET not in src:
-        print("  [!] gateway/run.py: auth check pattern not found — skipping")
-        return
-
-    # _backup is a no-op if run.py.napcat.bak already exists from _patch_run
-    _backup(path)
-    src = src.replace(_RUN_AUTH_TARGET, _RUN_AUTH_REPLACEMENT, 1)
-    _write(path, src)
-    print("  [+] Patched gateway/run.py (NapCat auth bypass)")
+    for rel, target, replacement in _AUTH_PATCH_SITES:
+        path = hermes_root / rel
+        if not path.exists():
+            continue
+        src = _read(path)
+        if _RUN_AUTH_MARKER in src:
+            print(f"  [=] {rel} auth bypass already patched")
+            return
+        if target in src:
+            # _backup is a no-op if a .napcat.bak already exists from _patch_run
+            _backup(path)
+            src = src.replace(target, replacement, 1)
+            _write_checked(path, src)
+            print(f"  [+] Patched {rel} (NapCat auth bypass)")
+            return
+    print(
+        "  [!] Auth check pattern not found in gateway/authz_mixin.py or "
+        "gateway/run.py — NapCat messages may be denied by the gateway "
+        "allowlist. Set GATEWAY_ALLOW_ALL_USERS=true as a workaround, or "
+        "update hermes-napcat."
+    )
 
 
 def _unpatch_run_auth(hermes_root: Path) -> None:
-    path = hermes_root / "gateway" / "run.py"
-    src = _read(path)
-    if _RUN_AUTH_MARKER not in src:
-        return
-    src = src.replace(_RUN_AUTH_REPLACEMENT, _RUN_AUTH_TARGET, 1)
-    _write(path, src)
-    print("  [-] Removed NapCat auth bypass from gateway/run.py")
+    for rel, target, replacement in _AUTH_PATCH_SITES:
+        path = hermes_root / rel
+        if not path.exists():
+            continue
+        src = _read(path)
+        if _RUN_AUTH_MARKER not in src:
+            continue
+        src = src.replace(replacement, target, 1)
+        _write(path, src)
+        # Drop the stale backup if run.py's was already consumed elsewhere
+        bak = path.with_suffix(path.suffix + ".napcat.bak")
+        if bak.exists() and rel.name == "authz_mixin.py":
+            bak.unlink()
+        print(f"  [-] Removed NapCat auth bypass from {rel}")
 
 
 # ── Step 7: install skill file ────────────────────────────────────────────────
@@ -487,8 +574,11 @@ def status(hermes_dir: str | None = None) -> None:
         _PLATFORMS_MARKER in _read(platforms_path)
         if platforms_path.exists() else False
     )
-    run_src = _read(root / "gateway" / "run.py")
-    run_auth_patched = _RUN_AUTH_MARKER in run_src
+    run_auth_patched = any(
+        _RUN_AUTH_MARKER in _read(p)
+        for p in _auth_patch_paths(root)
+        if p.exists()
+    )
     skill_installed = (root / "skills" / "qq" / "SKILL.md").exists()
 
     print(f"\nhermes-napcat status in: {root}")
